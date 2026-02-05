@@ -17,7 +17,6 @@ from pydantic import BaseModel, Field
 from claude_agent_sdk import (
     ClaudeSDKClient,
     ClaudeAgentOptions,
-    query,
     tool,
     create_sdk_mcp_server,
     AssistantMessage,
@@ -410,18 +409,21 @@ async def single_query(request: QueryRequest):
     duration = None
 
     try:
-        async for message in query(prompt=request.prompt, options=options):
-            if isinstance(message, ResultMessage):
-                result_text = message.result
-                session_id = message.session_id
-                is_error = message.is_error
-                total_cost = message.total_cost_usd
-                duration = message.duration_ms
-            elif isinstance(message, AssistantMessage):
-                # Capture the last assistant message text if no result
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        result_text = block.text
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(request.prompt)
+
+            async for message in client.receive_response():
+                if isinstance(message, ResultMessage):
+                    result_text = message.result
+                    session_id = message.session_id
+                    is_error = message.is_error
+                    total_cost = message.total_cost_usd
+                    duration = message.duration_ms
+                elif isinstance(message, AssistantMessage):
+                    # Capture the last assistant message text if no result
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            result_text = block.text
 
         return QueryResponse(
             result=result_text,
@@ -476,17 +478,20 @@ async def stream_query(request: QueryRequest):
     async def generate():
         import json
         try:
-            async for message in query(prompt=request.prompt, options=options):
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            yield f"data: {json.dumps({'type': 'text', 'text': block.text})}\n\n"
-                        elif isinstance(block, ToolUseBlock):
-                            yield f"data: {json.dumps({'type': 'tool_use', 'name': block.name, 'input': block.input})}\n\n"
-                        elif isinstance(block, ToolResultBlock):
-                            yield f"data: {json.dumps({'type': 'tool_result', 'tool_use_id': block.tool_use_id})}\n\n"
-                elif isinstance(message, ResultMessage):
-                    yield f"data: {json.dumps({'type': 'result', 'result': message.result, 'session_id': message.session_id, 'is_error': message.is_error, 'cost': message.total_cost_usd})}\n\n"
+            async with ClaudeSDKClient(options=options) as client:
+                await client.query(request.prompt)
+
+                async for message in client.receive_response():
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                yield f"data: {json.dumps({'type': 'text', 'text': block.text})}\n\n"
+                            elif isinstance(block, ToolUseBlock):
+                                yield f"data: {json.dumps({'type': 'tool_use', 'name': block.name, 'input': block.input})}\n\n"
+                            elif isinstance(block, ToolResultBlock):
+                                yield f"data: {json.dumps({'type': 'tool_result', 'tool_use_id': block.tool_use_id})}\n\n"
+                    elif isinstance(message, ResultMessage):
+                        yield f"data: {json.dumps({'type': 'result', 'result': message.result, 'session_id': message.session_id, 'is_error': message.is_error, 'cost': message.total_cost_usd})}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"

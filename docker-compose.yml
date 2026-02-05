@@ -22,40 +22,10 @@ services:
     working_dir: /app
     restart: unless-stopped
 
-    # Enable interactive mode for claude CLI
+    # Required for Claude CLI subprocess
     stdin_open: true
     tty: true
 
-    # Security hardening
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    # Note: read_only disabled - Claude Code needs write access to various directories
-
-    # Temporary filesystems for runtime needs
-    tmpfs:
-      - /tmp:mode=1777,size=256m
-      - /home/claude/.cache:mode=0755,size=512m
-      - /home/claude/.npm:mode=0755,size=256m
-      - /home/claude/.local:mode=0755,size=256m
-
-    # Resource limits
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-          cpus: '2.0'
-          pids: 100
-        reservations:
-          memory: 512M
-          cpus: '0.5'
-      restart_policy:
-        condition: on-failure
-        delay: 5s
-        max_attempts: 3
-
-    # Health check
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
