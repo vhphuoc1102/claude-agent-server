@@ -16,7 +16,15 @@ NC='\033[0m' # No Color
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_DIR="$HOME/.claude"
-ENV_FILE="$SCRIPT_DIR/.env"
+SETTINGS_FILE="$CLAUDE_DIR/settings.json"
+
+# Configuration variables (will be written to settings.json)
+CONFIG_API_KEY=""
+CONFIG_BASE_URL=""
+CONFIG_MODEL=""
+CONFIG_SONNET=""
+CONFIG_HAIKU=""
+CONFIG_OPUS=""
 
 # Print colored message
 print_msg() {
@@ -131,15 +139,15 @@ oauth2_auth() {
 
 apikey_auth() {
     echo ""
-    print_msg "$BLUE" "API Key Authentication"
+    print_msg "$BLUE" "API Key Authentication (for claude login)"
     echo ""
     
     # Check if running in a TTY
     if [ -t 0 ]; then
-        read -p "Enter your ANTHROPIC_API_KEY: " api_key
+        read -p "Enter your ANTHROPIC_API_KEY (for authentication): " api_key
     else
         print_msg "$YELLOW" "Non-interactive mode detected."
-        print_msg "$YELLOW" "Please set ANTHROPIC_API_KEY manually in .env file"
+        print_msg "$YELLOW" "Please run claude login manually"
         return 1
     fi
 
@@ -148,39 +156,21 @@ apikey_auth() {
         exit 1
     fi
 
-    # Save to .env file
-    echo "ANTHROPIC_API_KEY=$api_key" > "$ENV_FILE"
-    print_msg "$GREEN" "API key saved to .env file"
+    # Use key for claude login authentication
+    export ANTHROPIC_API_KEY="$api_key"
+    claude login
+    
+    if [ $? -eq 0 ]; then
+        print_msg "$GREEN" "API key authentication successful"
+    else
+        print_msg "$RED" "API key authentication failed"
+        exit 1
+    fi
 }
 
 # Configuration
 configure() {
     print_msg "$YELLOW" "[4/6] Configuration..."
-
-    echo ""
-    read -p "Do you want to configure custom settings? (y/N): " do_config
-
-    if [[ ! "$do_config" =~ ^[Yy]$ ]]; then
-        # Create empty .env if it doesn't exist
-        touch "$ENV_FILE"
-        return 0
-    fi
-
-    # Ensure .env exists
-    touch "$ENV_FILE"
-
-    # Proxy configuration
-    echo ""
-    read -p "Use a proxy for API requests? (y/N): " use_proxy
-    if [[ "$use_proxy" =~ ^[Yy]$ ]]; then
-        read -p "Enter ANTHROPIC_BASE_URL (e.g., http://127.0.0.1:8317): " base_url
-        if [ -n "$base_url" ]; then
-            # Remove existing ANTHROPIC_BASE_URL if present
-            sed -i '/^ANTHROPIC_BASE_URL=/d' "$ENV_FILE" 2>/dev/null || true
-            echo "ANTHROPIC_BASE_URL=$base_url" >> "$ENV_FILE"
-            print_msg "$GREEN" "Proxy URL configured"
-        fi
-    fi
 
     # Model configuration
     echo ""
@@ -189,70 +179,63 @@ configure() {
         configure_models
     fi
 
-    # Generate settings.json
-    echo ""
-    read -p "Generate Claude settings.json? (y/N): " gen_settings
-    if [[ "$gen_settings" =~ ^[Yy]$ ]]; then
-        generate_settings
-    fi
-
     print_msg "$GREEN" "Configuration complete"
 }
 
 configure_models() {
     echo ""
-    print_msg "$BLUE" "Model Configuration"
+    print_msg "$BLUE" "Container Configuration"
     print_msg "$YELLOW" "Press Enter to skip and use defaults"
     echo ""
 
+    # API key for settings.json (different from login authentication key)
+    read -p "Enter ANTHROPIC_AUTH_TOKEN (API key for container): " auth_token
+    if [ -n "$auth_token" ]; then
+        CONFIG_API_KEY="$auth_token"
+        print_msg "$GREEN" "Auth token configured for settings.json"
+    fi
+
+    read -p "Enter ANTHROPIC_BASE_URL (e.g., http://127.0.0.1:8317): " base_url
+    if [ -n "$base_url" ]; then
+        CONFIG_BASE_URL="$base_url"
+        print_msg "$GREEN" "Proxy URL configured"
+    fi
+
     read -p "Default model (ANTHROPIC_MODEL): " model
     if [ -n "$model" ]; then
-        sed -i '/^ANTHROPIC_MODEL=/d' "$ENV_FILE" 2>/dev/null || true
-        echo "ANTHROPIC_MODEL=$model" >> "$ENV_FILE"
+        CONFIG_MODEL="$model"
     fi
 
     read -p "Default Sonnet model (ANTHROPIC_DEFAULT_SONNET_MODEL): " sonnet_model
     if [ -n "$sonnet_model" ]; then
-        sed -i '/^ANTHROPIC_DEFAULT_SONNET_MODEL=/d' "$ENV_FILE" 2>/dev/null || true
-        echo "ANTHROPIC_DEFAULT_SONNET_MODEL=$sonnet_model" >> "$ENV_FILE"
+        CONFIG_SONNET="$sonnet_model"
     fi
 
     read -p "Default Haiku model (ANTHROPIC_DEFAULT_HAIKU_MODEL): " haiku_model
     if [ -n "$haiku_model" ]; then
-        sed -i '/^ANTHROPIC_DEFAULT_HAIKU_MODEL=/d' "$ENV_FILE" 2>/dev/null || true
-        echo "ANTHROPIC_DEFAULT_HAIKU_MODEL=$haiku_model" >> "$ENV_FILE"
+        CONFIG_HAIKU="$haiku_model"
     fi
 
     read -p "Default Opus model (ANTHROPIC_DEFAULT_OPUS_MODEL): " opus_model
     if [ -n "$opus_model" ]; then
-        sed -i '/^ANTHROPIC_DEFAULT_OPUS_MODEL=/d' "$ENV_FILE" 2>/dev/null || true
-        echo "ANTHROPIC_DEFAULT_OPUS_MODEL=$opus_model" >> "$ENV_FILE"
+        CONFIG_OPUS="$opus_model"
     fi
 }
 
 generate_settings() {
     mkdir -p "$CLAUDE_DIR"
-    local settings_file="$CLAUDE_DIR/settings.json"
 
-    # Read values from .env
-    local api_key=$(grep '^ANTHROPIC_API_KEY=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)
-    local base_url=$(grep '^ANTHROPIC_BASE_URL=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)
-    local model=$(grep '^ANTHROPIC_MODEL=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)
-    local sonnet=$(grep '^ANTHROPIC_DEFAULT_SONNET_MODEL=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)
-    local haiku=$(grep '^ANTHROPIC_DEFAULT_HAIKU_MODEL=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)
-    local opus=$(grep '^ANTHROPIC_DEFAULT_OPUS_MODEL=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)
-
-    # Build env object
+    # Build env object from config variables
     local env_entries=""
-    [ -n "$api_key" ] && env_entries="$env_entries\"ANTHROPIC_AUTH_TOKEN\": \"$api_key\""
-    [ -n "$base_url" ] && { [ -n "$env_entries" ] && env_entries="$env_entries, "; env_entries="$env_entries\"ANTHROPIC_BASE_URL\": \"$base_url\""; }
-    [ -n "$model" ] && { [ -n "$env_entries" ] && env_entries="$env_entries, "; env_entries="$env_entries\"ANTHROPIC_MODEL\": \"$model\""; }
-    [ -n "$sonnet" ] && { [ -n "$env_entries" ] && env_entries="$env_entries, "; env_entries="$env_entries\"ANTHROPIC_DEFAULT_SONNET_MODEL\": \"$sonnet\""; }
-    [ -n "$haiku" ] && { [ -n "$env_entries" ] && env_entries="$env_entries, "; env_entries="$env_entries\"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"$haiku\""; }
-    [ -n "$opus" ] && { [ -n "$env_entries" ] && env_entries="$env_entries, "; env_entries="$env_entries\"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"$opus\""; }
+    [ -n "$CONFIG_API_KEY" ] && env_entries="$env_entries\"ANTHROPIC_AUTH_TOKEN\": \"$CONFIG_API_KEY\""
+    [ -n "$CONFIG_BASE_URL" ] && { [ -n "$env_entries" ] && env_entries="$env_entries, "; env_entries="$env_entries\"ANTHROPIC_BASE_URL\": \"$CONFIG_BASE_URL\""; }
+    [ -n "$CONFIG_MODEL" ] && { [ -n "$env_entries" ] && env_entries="$env_entries, "; env_entries="$env_entries\"ANTHROPIC_MODEL\": \"$CONFIG_MODEL\""; }
+    [ -n "$CONFIG_SONNET" ] && { [ -n "$env_entries" ] && env_entries="$env_entries, "; env_entries="$env_entries\"ANTHROPIC_DEFAULT_SONNET_MODEL\": \"$CONFIG_SONNET\""; }
+    [ -n "$CONFIG_HAIKU" ] && { [ -n "$env_entries" ] && env_entries="$env_entries, "; env_entries="$env_entries\"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"$CONFIG_HAIKU\""; }
+    [ -n "$CONFIG_OPUS" ] && { [ -n "$env_entries" ] && env_entries="$env_entries, "; env_entries="$env_entries\"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"$CONFIG_OPUS\""; }
 
     # Generate settings.json
-    cat > "$settings_file" << EOF
+    cat > "$SETTINGS_FILE" << EOF
 {
     "autoUpdatesChannel": "latest",
     "env": {
@@ -264,20 +247,24 @@ generate_settings() {
 }
 EOF
 
-    print_msg "$GREEN" "Settings saved to $settings_file"
+    print_msg "$GREEN" "Settings saved to $SETTINGS_FILE"
 }
 
-# Prepare .claude directory for mounting
+# Prepare .claude directory and generate settings.json
 prepare_claude_dir() {
-    print_msg "$YELLOW" "[5/6] Preparing .claude directory..."
+    print_msg "$YELLOW" "[5/6] Preparing .claude directory and settings..."
 
     if [ ! -d "$CLAUDE_DIR" ]; then
         mkdir -p "$CLAUDE_DIR"
         print_msg "$BLUE" "Created $CLAUDE_DIR"
     fi
 
+    # Generate settings.json with collected configuration
+    generate_settings
+
     # Ensure proper permissions
     chmod 755 "$CLAUDE_DIR"
+    chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
 
     print_msg "$GREEN" ".claude directory ready for mounting"
 }
@@ -335,9 +322,8 @@ run_docker() {
     echo "  Stop server:   docker-compose down"
     echo "  Restart:       docker-compose restart"
     echo ""
-    print_msg "$YELLOW" "Configuration files:"
-    echo "  Environment:   $ENV_FILE"
-    echo "  Claude config: $CLAUDE_DIR/settings.json"
+    print_msg "$YELLOW" "Configuration file:"
+    echo "  Claude config: $SETTINGS_FILE"
     echo ""
 }
 

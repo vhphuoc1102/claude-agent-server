@@ -13,20 +13,7 @@ services:
     ports:
       - "8000:8000"
 
-    # Load environment variables from .env file
-    env_file:
-      - .env
-
-    environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      # Optional: Route API requests through a proxy for credential management
-      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
-      # Optional: Custom model configuration
-      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
-      - ANTHROPIC_DEFAULT_SONNET_MODEL=${ANTHROPIC_DEFAULT_SONNET_MODEL:-}
-      - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}
-      - ANTHROPIC_DEFAULT_OPUS_MODEL=${ANTHROPIC_DEFAULT_OPUS_MODEL:-}
-
+    # Configuration is loaded from mounted settings.json in .claude directory
     # Mount host's .claude directory for settings and credentials
     volumes:
       - ${HOME}/.claude:/home/claude/.claude:rw

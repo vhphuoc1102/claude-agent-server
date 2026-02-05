@@ -1,7 +1,9 @@
 # Claude Code SDK HTTP Server
 #
 # Build: docker build -t claude-sdk-server .
-# Run: docker run -p 8000:8000 -e ANTHROPIC_API_KEY=your-key claude-sdk-server
+# Run: docker run -p 8000:8000 -v ~/.claude:/home/claude/.claude claude-sdk-server
+#
+# Configuration is stored in ~/.claude/settings.json (mounted into container)
 #
 # Security hardening based on:
 # - https://docs.anthropic.com/docs/en/agent-sdk/hosting
