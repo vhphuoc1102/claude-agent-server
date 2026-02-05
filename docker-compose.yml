@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   claude-server:
     build:
@@ -43,6 +41,7 @@ services:
         limits:
           memory: 2G
           cpus: '2.0'
+          pids: 100
         reservations:
           memory: 512M
           cpus: '0.5'
@@ -50,9 +49,6 @@ services:
         condition: unless-stopped
         delay: 5s
         max_attempts: 3
-
-    # Process limits
-    pids_limit: 100
 
     # Health check
     healthcheck:
