@@ -1,83 +1,69 @@
-# Claude Code SDK HTTP Server - Docker Compose Configuration
-#
-# Security hardening based on:
-# - https://docs.anthropic.com/docs/en/agent-sdk/hosting
-# - https://docs.anthropic.com/docs/en/agent-sdk/secure-deployment
-#
-# Usage:
-#   docker-compose up -d
-#   docker-compose logs -f
+version: '3.8'
+
 services:
   claude-server:
-    container_name: claude-server
-    build: .
-    
-    # Load environment variables from .env file
-    env_file:
-      - .env
-    
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: claude-agent-server
     ports:
-      - "8000:8000"
-
-    # Configuration is loaded from mounted settings.json in .claude directory
-    # Mount host's .claude directory for settings and credentials
+      - "${PORT:-8000}:8000"
+    environment:
+      - PORT=${PORT:-8000}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN:-}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
+      - ANTHROPIC_DEFAULT_OPUS_MODEL=${ANTHROPIC_DEFAULT_OPUS_MODEL:-}
+      - ANTHROPIC_DEFAULT_SONNET_MODEL=${ANTHROPIC_DEFAULT_SONNET_MODEL:-}
+      - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}
     volumes:
-      - ${HOME}/.claude:/home/claude/.claude:rw
-
-    # Security hardening options (from secure-deployment guide)
-
-    # Drop all Linux capabilities to prevent privilege escalation
-    cap_drop:
-      - ALL
-
-    # Prevent processes from gaining new privileges via setuid binaries
-    security_opt:
-      - no-new-privileges:true
-      # Optional: Use custom seccomp profile for additional syscall restrictions
-      # - seccomp=/path/to/seccomp-profile.json
-
-    # Limit process count to prevent fork bombs (moved to deploy.resources.limits)
-
-    # Run as non-root user (matches Dockerfile USER directive)
-    user: "1000:1000"
-
-    # Read-only root filesystem with tmpfs for writable areas
-    read_only: true
-    tmpfs:
-      # Temporary files - noexec prevents script execution
-      - /tmp:rw,noexec,nosuid,size=100m
-      # Agent workspace for file operations
-      - /workspace:rw,noexec,nosuid,size=500m
-      # User cache directory for npm, pip, etc.
-      - /home/claude/.cache:rw,noexec,nosuid,size=200m
-      # Note: /home/claude/.config removed - .claude is mounted from host
-
-    # Mount code directory as read-only for analysis tasks
-    # WARNING: Avoid mounting directories containing credentials (.env, .aws, etc.)
-    # volumes:
-    #   # Example: Mount project code read-only
-    #   - ./code:/code:ro
-    #   # For persistent workspace (remove tmpfs /workspace above):
-    #   - ./workspace:/workspace:rw
-
+      # Mount Claude credentials/config from host
+      - ${CLAUDE_CONFIG_PATH:-~/.claude}:/home/claude/.claude:rw
+      # Mount workspace for file operations
+      - ${WORKSPACE_PATH:-./workspace}:/workspace:rw
     working_dir: /app
     restart: unless-stopped
 
-    # Resource limits as recommended in hosting documentation
-    # Adjust based on your workload requirements
+    # Security hardening
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+
+    # Temporary filesystems for runtime needs
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+      - /home/claude/.cache:mode=0755,size=512m
+      - /home/claude/.npm:mode=0755,size=256m
+
+    # Resource limits
     deploy:
       resources:
         limits:
-          # Recommended: 2GiB RAM for production workloads
           memory: 2G
           cpus: '2.0'
-          pids: 100
         reservations:
-          memory: 1G
-          cpus: '1.0'
+          memory: 512M
+          cpus: '0.5'
+      restart_policy:
+        condition: unless-stopped
+        delay: 5s
+        max_attempts: 3
 
-    # Network isolation (optional - for maximum security)
-    # Uncomment to restrict network access via proxy only
-    # network_mode: none
-    # volumes:
-    #   - /var/run/proxy.sock:/var/run/proxy.sock:ro
+    # Process limits
+    pids_limit: 100
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# Optional: Create workspace network for isolation
+networks:
+  default:
+    name: claude-network
+    driver: bridge
