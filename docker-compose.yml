@@ -9,7 +9,13 @@
 #   docker-compose logs -f
 services:
   claude-server:
+    container_name: claude-server
     build: .
+    
+    # Load environment variables from .env file
+    env_file:
+      - .env
+    
     ports:
       - "8000:8000"
 
