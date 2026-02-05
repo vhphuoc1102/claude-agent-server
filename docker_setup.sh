@@ -148,7 +148,7 @@ apikey_auth() {
     else
         print_msg "$YELLOW" "Non-interactive mode detected."
         print_msg "$YELLOW" "Please run claude login manually"
-        return 1
+        return 0
     fi
 
     if [ -z "$api_key" ]; then
@@ -158,9 +158,14 @@ apikey_auth() {
 
     # Use key for claude login authentication
     export ANTHROPIC_API_KEY="$api_key"
-    claude login
     
-    if [ $? -eq 0 ]; then
+    # Run claude login and capture exit code (disable set -e temporarily)
+    set +e
+    claude login </dev/tty
+    local login_result=$?
+    set -e
+    
+    if [ $login_result -eq 0 ]; then
         print_msg "$GREEN" "API key authentication successful"
     else
         print_msg "$RED" "API key authentication failed"
