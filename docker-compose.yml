@@ -1,0 +1,90 @@
+# Claude Code SDK HTTP Server - Docker Compose Configuration
+#
+# Security hardening based on:
+# - https://docs.anthropic.com/docs/en/agent-sdk/hosting
+# - https://docs.anthropic.com/docs/en/agent-sdk/secure-deployment
+#
+# Usage:
+#   docker-compose up -d
+#   docker-compose logs -f
+services:
+  claude-server:
+    build: .
+    ports:
+      - "8000:8000"
+
+    # Load environment variables from .env file
+    env_file:
+      - .env
+
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # Optional: Route API requests through a proxy for credential management
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
+      # Optional: Custom model configuration
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
+      - ANTHROPIC_DEFAULT_SONNET_MODEL=${ANTHROPIC_DEFAULT_SONNET_MODEL:-}
+      - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}
+      - ANTHROPIC_DEFAULT_OPUS_MODEL=${ANTHROPIC_DEFAULT_OPUS_MODEL:-}
+
+    # Mount host's .claude directory for settings and credentials
+    volumes:
+      - ${HOME}/.claude:/home/claude/.claude:rw
+
+    # Security hardening options (from secure-deployment guide)
+
+    # Drop all Linux capabilities to prevent privilege escalation
+    cap_drop:
+      - ALL
+
+    # Prevent processes from gaining new privileges via setuid binaries
+    security_opt:
+      - no-new-privileges:true
+      # Optional: Use custom seccomp profile for additional syscall restrictions
+      # - seccomp=/path/to/seccomp-profile.json
+
+    # Limit process count to prevent fork bombs
+    pids_limit: 100
+
+    # Run as non-root user (matches Dockerfile USER directive)
+    user: "1000:1000"
+
+    # Read-only root filesystem with tmpfs for writable areas
+    read_only: true
+    tmpfs:
+      # Temporary files - noexec prevents script execution
+      - /tmp:rw,noexec,nosuid,size=100m
+      # Agent workspace for file operations
+      - /workspace:rw,noexec,nosuid,size=500m
+      # User cache directory for npm, pip, etc.
+      - /home/claude/.cache:rw,noexec,nosuid,size=200m
+      # Note: /home/claude/.config removed - .claude is mounted from host
+
+    # Mount code directory as read-only for analysis tasks
+    # WARNING: Avoid mounting directories containing credentials (.env, .aws, etc.)
+    # volumes:
+    #   # Example: Mount project code read-only
+    #   - ./code:/code:ro
+    #   # For persistent workspace (remove tmpfs /workspace above):
+    #   - ./workspace:/workspace:rw
+
+    working_dir: /workspace
+    restart: unless-stopped
+
+    # Resource limits as recommended in hosting documentation
+    # Adjust based on your workload requirements
+    deploy:
+      resources:
+        limits:
+          # Recommended: 2GiB RAM for production workloads
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 1G
+          cpus: '1.0'
+
+    # Network isolation (optional - for maximum security)
+    # Uncomment to restrict network access via proxy only
+    # network_mode: none
+    # volumes:
+    #   - /var/run/proxy.sock:/var/run/proxy.sock:ro
