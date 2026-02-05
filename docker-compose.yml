@@ -54,7 +54,7 @@ services:
     #   # For persistent workspace (remove tmpfs /workspace above):
     #   - ./workspace:/workspace:rw
 
-    working_dir: /workspace
+    working_dir: /app
     restart: unless-stopped
 
     # Resource limits as recommended in hosting documentation
