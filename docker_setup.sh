@@ -74,8 +74,8 @@ install_claude() {
     print_msg "$BLUE" "Installing Claude Code..."
     curl -fsSL https://claude.ai/install.sh | bash
 
-    # Reload shell environment
-    export PATH="$HOME/.claude/bin:$PATH"
+    # Reload shell environment (Claude Code installs to ~/.local/bin)
+    export PATH="$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 
     if command -v claude &> /dev/null; then
         print_msg "$GREEN" "Claude Code installed successfully"
