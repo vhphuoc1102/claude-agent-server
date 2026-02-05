@@ -30,8 +30,7 @@ services:
       # Optional: Use custom seccomp profile for additional syscall restrictions
       # - seccomp=/path/to/seccomp-profile.json
 
-    # Limit process count to prevent fork bombs
-    pids_limit: 100
+    # Limit process count to prevent fork bombs (moved to deploy.resources.limits)
 
     # Run as non-root user (matches Dockerfile USER directive)
     user: "1000:1000"
@@ -66,6 +65,7 @@ services:
           # Recommended: 2GiB RAM for production workloads
           memory: 2G
           cpus: '2.0'
+          pids: 100
         reservations:
           memory: 1G
           cpus: '1.0'
