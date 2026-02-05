@@ -136,12 +136,7 @@ apikey_auth() {
     
     # Check if running in a TTY
     if [ -t 0 ]; then
-        # Disable echo for password input
-        stty -echo 2>/dev/null || true
-        printf "Enter your ANTHROPIC_API_KEY: "
-        read api_key
-        stty echo 2>/dev/null || true
-        echo ""
+        read -p "Enter your ANTHROPIC_API_KEY: " api_key
     else
         print_msg "$YELLOW" "Non-interactive mode detected."
         print_msg "$YELLOW" "Please set ANTHROPIC_API_KEY manually in .env file"
