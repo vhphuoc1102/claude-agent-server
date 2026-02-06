@@ -107,6 +107,51 @@ custom_tools_server = create_sdk_mcp_server(
 
 
 # ============================================================================
+# Validation Functions
+# ============================================================================
+
+def validate_output_format(output_format: dict[str, Any] | None) -> None:
+    """
+    Validate output_format structure before passing to SDK.
+
+    Raises HTTPException if format is invalid.
+    """
+    if output_format is None:
+        return
+
+    if not isinstance(output_format, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="output_format must be a dictionary"
+        )
+
+    if "type" not in output_format:
+        raise HTTPException(
+            status_code=422,
+            detail="output_format must contain 'type' field"
+        )
+
+    if output_format["type"] != "json_schema":
+        raise HTTPException(
+            status_code=422,
+            detail="output_format type must be 'json_schema'"
+        )
+
+    if "schema" not in output_format:
+        raise HTTPException(
+            status_code=422,
+            detail="output_format must contain 'schema' field"
+        )
+
+    schema = output_format["schema"]
+    if not isinstance(schema, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="output_format schema must be a dictionary"
+        )
+
+
+# ============================================================================
 # Session Management
 # ============================================================================
 
@@ -215,6 +260,10 @@ class QueryRequest(BaseModel):
         default_factory=list,
         description="Setting sources for skill loading: ['user', 'project']"
     )
+    output_format: dict[str, Any] | None = Field(
+        None,
+        description="Structured output format configuration with 'type' and 'schema' fields"
+    )
 
 
 class QueryResponse(BaseModel):
@@ -224,6 +273,14 @@ class QueryResponse(BaseModel):
     is_error: bool = Field(False, description="Whether the query resulted in an error")
     total_cost_usd: float | None = Field(None, description="Total cost in USD")
     duration_ms: int | None = Field(None, description="Duration in milliseconds")
+    structured_output: dict[str, Any] | None = Field(
+        None,
+        description="Validated structured output matching the provided JSON schema"
+    )
+    subtype: str | None = Field(
+        None,
+        description="Result subtype: 'success', 'error_max_structured_output_retries', etc."
+    )
 
 
 class SessionRequest(BaseModel):
@@ -247,6 +304,10 @@ class SessionRequest(BaseModel):
         default_factory=list,
         description="Setting sources for skill loading: ['user', 'project']"
     )
+    output_format: dict[str, Any] | None = Field(
+        None,
+        description="Structured output format configuration with 'type' and 'schema' fields"
+    )
 
 
 class SessionResponse(BaseModel):
@@ -264,6 +325,14 @@ class ChatResponse(BaseModel):
     """Response model for chat messages."""
     response: str
     is_complete: bool = True
+    structured_output: dict[str, Any] | None = Field(
+        None,
+        description="Validated structured output if output_format was configured in session"
+    )
+    subtype: str | None = Field(
+        None,
+        description="Result subtype for structured output validation status"
+    )
 
 
 class MessageContent(BaseModel):
@@ -372,6 +441,9 @@ async def single_query(request: QueryRequest):
     """
     import traceback
 
+    # Validate output_format if provided
+    validate_output_format(request.output_format)
+
     # Build options
     mcp_servers = {}
     allowed_tools = list(request.allowed_tools)
@@ -399,7 +471,8 @@ async def single_query(request: QueryRequest):
         permission_mode=request.permission_mode,
         cwd=request.cwd,
         mcp_servers=mcp_servers if mcp_servers else None,
-        setting_sources=setting_sources
+        setting_sources=setting_sources,
+        output_format=request.output_format
     )
 
     result_text = None
@@ -407,6 +480,8 @@ async def single_query(request: QueryRequest):
     is_error = False
     total_cost = None
     duration = None
+    structured_output = None
+    subtype = None
 
     try:
         async with ClaudeSDKClient(options=options) as client:
@@ -419,6 +494,8 @@ async def single_query(request: QueryRequest):
                     is_error = message.is_error
                     total_cost = message.total_cost_usd
                     duration = message.duration_ms
+                    structured_output = message.structured_output
+                    subtype = message.subtype
                 elif isinstance(message, AssistantMessage):
                     # Capture the last assistant message text if no result
                     for block in message.content:
@@ -430,7 +507,9 @@ async def single_query(request: QueryRequest):
             session_id=session_id or str(uuid.uuid4()),
             is_error=is_error,
             total_cost_usd=total_cost,
-            duration_ms=duration
+            duration_ms=duration,
+            structured_output=structured_output,
+            subtype=subtype
         )
 
     except Exception as e:
@@ -446,6 +525,9 @@ async def stream_query(request: QueryRequest):
 
     Returns a stream of server-sent events (SSE) with real-time responses.
     """
+    # Validate output_format if provided
+    validate_output_format(request.output_format)
+
     mcp_servers = {}
     allowed_tools = list(request.allowed_tools)
 
@@ -472,7 +554,8 @@ async def stream_query(request: QueryRequest):
         permission_mode=request.permission_mode,
         cwd=request.cwd,
         mcp_servers=mcp_servers if mcp_servers else None,
-        setting_sources=setting_sources
+        setting_sources=setting_sources,
+        output_format=request.output_format
     )
 
     async def generate():
@@ -491,7 +574,16 @@ async def stream_query(request: QueryRequest):
                             elif isinstance(block, ToolResultBlock):
                                 yield f"data: {json.dumps({'type': 'tool_result', 'tool_use_id': block.tool_use_id})}\n\n"
                     elif isinstance(message, ResultMessage):
-                        yield f"data: {json.dumps({'type': 'result', 'result': message.result, 'session_id': message.session_id, 'is_error': message.is_error, 'cost': message.total_cost_usd})}\n\n"
+                        result_data = {
+                            'type': 'result',
+                            'result': message.result,
+                            'session_id': message.session_id,
+                            'is_error': message.is_error,
+                            'cost': message.total_cost_usd,
+                            'structured_output': message.structured_output,
+                            'subtype': message.subtype
+                        }
+                        yield f"data: {json.dumps(result_data)}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
@@ -513,6 +605,9 @@ async def create_session(request: SessionRequest):
 
     Sessions maintain conversation context across multiple messages.
     """
+    # Validate output_format if provided
+    validate_output_format(request.output_format)
+
     mcp_servers = {}
     allowed_tools = list(request.allowed_tools)
 
@@ -538,7 +633,8 @@ async def create_session(request: SessionRequest):
         permission_mode=request.permission_mode,
         cwd=request.cwd,
         mcp_servers=mcp_servers if mcp_servers else None,
-        setting_sources=setting_sources
+        setting_sources=setting_sources,
+        output_format=request.output_format
     )
 
     try:
@@ -577,13 +673,23 @@ async def chat(session_id: str, request: ChatRequest):
         await client.query(request.message)
 
         response_text = ""
+        structured_output = None
+        subtype = None
+
         async for message in client.receive_response():
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         response_text += block.text
+            elif isinstance(message, ResultMessage):
+                structured_output = message.structured_output
+                subtype = message.subtype
 
-        return ChatResponse(response=response_text)
+        return ChatResponse(
+            response=response_text,
+            structured_output=structured_output,
+            subtype=subtype
+        )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -614,7 +720,13 @@ async def chat_stream(session_id: str, request: ChatRequest):
                         elif isinstance(block, ToolUseBlock):
                             yield f"data: {json.dumps({'type': 'tool_use', 'name': block.name})}\n\n"
                 elif isinstance(message, ResultMessage):
-                    yield f"data: {json.dumps({'type': 'done', 'session_id': session_id})}\n\n"
+                    done_data = {
+                        'type': 'done',
+                        'session_id': session_id,
+                        'structured_output': message.structured_output,
+                        'subtype': message.subtype
+                    }
+                    yield f"data: {json.dumps(done_data)}\n\n"
 
             yield "data: [DONE]\n\n"
         except Exception as e:

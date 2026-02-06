@@ -634,6 +634,213 @@ result = client.query("List Python files", allowed_tools=["Glob"], cwd="/workspa
 print(result["result"])
 ```
 
+### Structured Outputs
+
+Request structured, validated JSON responses from Claude by providing a JSON Schema. The agent can still use any tools it needs, but returns data in your specified format.
+
+#### Basic Example
+
+```bash
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Research Anthropic and provide key company information",
+    "output_format": {
+      "type": "json_schema",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "company_name": {"type": "string"},
+          "founded_year": {"type": "number"},
+          "headquarters": {"type": "string"}
+        },
+        "required": ["company_name"]
+      }
+    }
+  }'
+```
+
+**Response:**
+```json
+{
+  "result": "Research completed successfully.",
+  "session_id": "abc123",
+  "is_error": false,
+  "total_cost_usd": 0.0234,
+  "duration_ms": 2156,
+  "structured_output": {
+    "company_name": "Anthropic",
+    "founded_year": 2021,
+    "headquarters": "San Francisco, CA"
+  },
+  "subtype": "success"
+}
+```
+
+#### Session with Structured Output
+
+Configure structured outputs when creating a session - all responses in that session will return structured data:
+
+```bash
+# Create session with output format
+SESSION=$(curl -s -X POST http://localhost:8000/sessions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "system_prompt": "You are a data extraction assistant",
+    "allowed_tools": ["Read", "Grep", "Glob"],
+    "output_format": {
+      "type": "json_schema",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "todos": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "text": {"type": "string"},
+                "file": {"type": "string"},
+                "line": {"type": "number"}
+              },
+              "required": ["text", "file", "line"]
+            }
+          },
+          "total_count": {"type": "number"}
+        },
+        "required": ["todos", "total_count"]
+      }
+    }
+  }' | jq -r '.session_id')
+
+# Send message - response will be structured
+curl -X POST http://localhost:8000/sessions/$SESSION/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Find all TODO comments in Python files"}'
+```
+
+**Response:**
+```json
+{
+  "response": "Found 5 TODO comments across 3 files",
+  "is_complete": true,
+  "structured_output": {
+    "todos": [
+      {"text": "Add error handling", "file": "server.py", "line": 142},
+      {"text": "Implement caching", "file": "utils.py", "line": 89}
+    ],
+    "total_count": 5
+  },
+  "subtype": "success"
+}
+```
+
+#### Streaming with Structured Output
+
+Streaming responses include structured output in the final result message:
+
+```bash
+curl -X POST http://localhost:8000/query/stream \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+    "prompt": "List all Python files and count lines of code",
+    "allowed_tools": ["Glob", "Read"],
+    "output_format": {
+      "type": "json_schema",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {"type": "string"},
+                "lines": {"type": "number"}
+              }
+            }
+          },
+          "total_lines": {"type": "number"}
+        }
+      }
+    }
+  }'
+```
+
+**Stream output:**
+```
+data: {"type": "text", "text": "I'll find all Python files and count their lines..."}
+
+data: {"type": "tool_use", "name": "Glob", "input": {"pattern": "**/*.py"}}
+
+data: {"type": "result", "result": "Analysis complete", "structured_output": {"files": [{"path": "server.py", "lines": 671}], "total_lines": 671}, "subtype": "success"}
+
+data: [DONE]
+```
+
+#### Pydantic Integration (Python)
+
+Generate JSON schemas from Pydantic models for type safety:
+
+```python
+from pydantic import BaseModel
+import requests
+
+class CodeStats(BaseModel):
+    total_files: int
+    total_lines: int
+    languages: dict[str, int]
+
+# Get JSON schema from Pydantic model
+schema = CodeStats.model_json_schema()
+
+# Use in request
+response = requests.post(
+    "http://localhost:8000/query",
+    json={
+        "prompt": "Analyze code statistics for this project",
+        "output_format": {
+            "type": "json_schema",
+            "schema": schema
+        }
+    }
+)
+
+# Validate response with Pydantic
+if response.json()["subtype"] == "success":
+    stats = CodeStats.model_validate(response.json()["structured_output"])
+    print(f"Total lines: {stats.total_lines}")
+```
+
+#### Error Handling
+
+Always check the `subtype` field to handle structured output errors:
+
+| Subtype | Meaning |
+|---------|---------|
+| `success` | Output generated and validated successfully |
+| `error_max_structured_output_retries` | Could not produce valid output after retries |
+
+```bash
+RESPONSE=$(curl -s -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Extract data...",
+    "output_format": {...}
+  }')
+
+# Check if successful
+echo $RESPONSE | jq -r 'if .subtype == "success" then .structured_output else "Error: " + .subtype end'
+```
+
+#### Best Practices
+
+1. **Keep schemas simple** - Start with basic types and add complexity as needed
+2. **Make fields optional** - Use `required` only for essential fields
+3. **Use clear prompts** - Help Claude understand what data to extract
+4. **Validate responses** - Always check `subtype` before using `structured_output`
+5. **Test schemas** - Verify your schema produces expected results with sample queries
+
 ---
 
 ## Error Handling
