@@ -13,8 +13,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends, status
 from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 
 from claude_agent_sdk import (
@@ -430,6 +431,45 @@ app = FastAPI(
 
 
 # ============================================================================
+# Authentication
+# ============================================================================
+
+security = HTTPBearer(auto_error=False)
+
+
+async def verify_api_key(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security)
+) -> None:
+    """
+    Verify API key from Bearer token.
+
+    Raises:
+        HTTPException: 401 if credentials missing, 403 if invalid
+    """
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Load API_KEY at runtime to support hot-reloading
+    api_key = os.getenv("API_KEY")
+
+    if api_key is None:
+        # Authentication disabled if API_KEY not set
+        logger.warning("API_KEY not set - authentication disabled (development only)")
+        return
+
+    if credentials.credentials != api_key:
+        logger.warning("Failed authentication attempt")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid authentication credentials",
+        )
+
+
+# ============================================================================
 # Request/Response Models
 # ============================================================================
 
@@ -588,7 +628,10 @@ def _extract_description(skill_file) -> str | None:
 
 
 @app.get("/skills", response_model=SkillsListResponse)
-async def list_skills(cwd: str | None = Query(None, description="Working directory for project skills")):
+async def list_skills(
+    cwd: str | None = Query(None, description="Working directory for project skills"),
+    _: None = Depends(verify_api_key)
+):
     """
     List available skills from user and project directories.
 
@@ -631,7 +674,10 @@ async def list_skills(cwd: str | None = Query(None, description="Working directo
 
 
 @app.post("/query", response_model=QueryResponse)
-async def single_query(request: QueryRequest):
+async def single_query(
+    request: QueryRequest,
+    _: None = Depends(verify_api_key)
+):
     """
     Execute a one-shot query to Claude.
 
@@ -733,7 +779,10 @@ async def single_query(request: QueryRequest):
 
 
 @app.post("/query/stream")
-async def stream_query(request: QueryRequest):
+async def stream_query(
+    request: QueryRequest,
+    _: None = Depends(verify_api_key)
+):
     """
     Execute a streaming query to Claude.
 
@@ -824,7 +873,10 @@ async def stream_query(request: QueryRequest):
 
 
 @app.post("/sessions", response_model=SessionResponse)
-async def create_session(request: SessionRequest):
+async def create_session(
+    request: SessionRequest,
+    _: None = Depends(verify_api_key)
+):
     """
     Create a new persistent session.
 
@@ -899,7 +951,10 @@ async def create_session(request: SessionRequest):
 
 
 @app.delete("/sessions/{session_id}", response_model=SessionResponse)
-async def delete_session(session_id: str):
+async def delete_session(
+    session_id: str,
+    _: None = Depends(verify_api_key)
+):
     """Close and delete a session."""
     try:
         await session_manager.close_session(session_id)
@@ -911,7 +966,11 @@ async def delete_session(session_id: str):
 
 
 @app.post("/sessions/{session_id}/chat", response_model=ChatResponse)
-async def chat(session_id: str, request: ChatRequest):
+async def chat(
+    session_id: str,
+    request: ChatRequest,
+    _: None = Depends(verify_api_key)
+):
     """
     Send a message in an existing session.
 
@@ -950,7 +1009,11 @@ async def chat(session_id: str, request: ChatRequest):
 
 
 @app.post("/sessions/{session_id}/chat/stream")
-async def chat_stream(session_id: str, request: ChatRequest):
+async def chat_stream(
+    session_id: str,
+    request: ChatRequest,
+    _: None = Depends(verify_api_key)
+):
     """
     Send a message and stream the response.
 
@@ -997,7 +1060,10 @@ async def chat_stream(session_id: str, request: ChatRequest):
 
 
 @app.post("/sessions/{session_id}/interrupt")
-async def interrupt_session(session_id: str):
+async def interrupt_session(
+    session_id: str,
+    _: None = Depends(verify_api_key)
+):
     """Interrupt the current task in a session."""
     try:
         client = await session_manager.get_session(session_id)
@@ -1010,7 +1076,7 @@ async def interrupt_session(session_id: str):
 
 
 @app.get("/sessions")
-async def list_sessions():
+async def list_sessions(_: None = Depends(verify_api_key)):
     """List all active sessions."""
     return {
         "sessions": list(session_manager.sessions.keys()),
@@ -1025,9 +1091,16 @@ async def list_sessions():
 if __name__ == "__main__":
     import os
     import uvicorn
-    
+
     port = int(os.getenv("PORT", "8000"))
-    
+    api_key = os.getenv("API_KEY")
+
+    # Log authentication status
+    if api_key:
+        logger.info("🔒 API authentication enabled")
+    else:
+        logger.warning("⚠️  API_KEY not set - authentication disabled (development only)")
+
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
