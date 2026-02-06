@@ -6,8 +6,11 @@ Supports session management, streaming responses, and custom tools.
 """
 
 import asyncio
+import logging
+import shutil
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
@@ -107,6 +110,164 @@ custom_tools_server = create_sdk_mcp_server(
 
 
 # ============================================================================
+# Workspace Management
+# ============================================================================
+
+logger = logging.getLogger(__name__)
+
+
+class WorkspaceManager:
+    """Manages temporary working directories for queries and sessions."""
+
+    def __init__(self):
+        self.base_dir = Path.home() / ".claude" / "workspaces"
+        self._lock = asyncio.Lock()
+        self.workspace_owners: dict[str, str] = {}  # identifier -> owner_type
+
+    async def initialize(self) -> None:
+        """
+        Initialize workspace manager.
+
+        - Creates base workspace directory if it doesn't exist
+        - Cleans up orphaned workspaces (older than 24 hours)
+        """
+        try:
+            # Create base directory
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Workspace base directory: {self.base_dir}")
+
+            # Cleanup orphaned workspaces
+            await self._cleanup_orphaned_workspaces()
+
+        except Exception as e:
+            logger.error(f"Failed to initialize workspace manager: {e}")
+            raise
+
+    async def _cleanup_orphaned_workspaces(self) -> None:
+        """Remove workspace directories older than 24 hours."""
+        if not self.base_dir.exists():
+            return
+
+        import time
+        current_time = time.time()
+        max_age_seconds = 24 * 3600  # 24 hours
+
+        try:
+            for workspace_path in self.base_dir.iterdir():
+                if not workspace_path.is_dir():
+                    continue
+
+                # Check age of directory
+                dir_mtime = workspace_path.stat().st_mtime
+                age_seconds = current_time - dir_mtime
+
+                if age_seconds > max_age_seconds:
+                    try:
+                        shutil.rmtree(workspace_path)
+                        age_hours = age_seconds / 3600
+                        logger.info(
+                            f"Removed orphaned workspace: {workspace_path.name} "
+                            f"(age: {age_hours:.1f}h)"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to remove orphaned workspace {workspace_path}: {e}"
+                        )
+
+        except Exception as e:
+            logger.warning(f"Error during orphaned workspace cleanup: {e}")
+
+    async def create_workspace(self, identifier: str, owner_type: str) -> str:
+        """
+        Create a new workspace directory.
+
+        Args:
+            identifier: Unique identifier (UUID for queries, session_id for sessions)
+            owner_type: Type of owner ("query", "query_stream", "session")
+
+        Returns:
+            Absolute path to the created workspace directory
+
+        Raises:
+            Exception: If workspace creation fails
+        """
+        async with self._lock:
+            workspace_path = self.base_dir / identifier
+
+            try:
+                # Create workspace directory
+                workspace_path.mkdir(parents=True, exist_ok=False)
+
+                # Track ownership
+                self.workspace_owners[identifier] = owner_type
+
+                logger.info(
+                    f"Created workspace: {workspace_path} for {owner_type}:{identifier}"
+                )
+
+                return str(workspace_path)
+
+            except FileExistsError:
+                logger.warning(f"Workspace already exists: {workspace_path}")
+                # Track ownership anyway
+                self.workspace_owners[identifier] = owner_type
+                return str(workspace_path)
+
+            except Exception as e:
+                logger.error(f"Failed to create workspace {workspace_path}: {e}")
+                raise
+
+    async def cleanup_workspace(self, identifier: str) -> bool:
+        """
+        Remove a workspace directory.
+
+        Args:
+            identifier: The workspace identifier to cleanup
+
+        Returns:
+            True if workspace was cleaned up, False otherwise
+        """
+        async with self._lock:
+            # Check if we track this workspace
+            if identifier not in self.workspace_owners:
+                logger.debug(f"Workspace {identifier} not tracked, skipping cleanup")
+                return False
+
+            workspace_path = self.base_dir / identifier
+            owner_type = self.workspace_owners[identifier]
+
+            # Remove from tracking first
+            del self.workspace_owners[identifier]
+
+        # Delete directory outside lock to avoid blocking
+        try:
+            if workspace_path.exists():
+                shutil.rmtree(workspace_path)
+                logger.info(f"Cleaned workspace: {workspace_path} ({owner_type})")
+                return True
+            else:
+                logger.debug(f"Workspace {workspace_path} doesn't exist, skipping")
+                return False
+
+        except Exception as e:
+            logger.warning(f"Failed to cleanup workspace {workspace_path}: {e}")
+            return False
+
+    async def cleanup_all(self) -> None:
+        """Emergency cleanup of all tracked workspaces."""
+        async with self._lock:
+            identifiers = list(self.workspace_owners.keys())
+
+        logger.info(f"Cleaning up {len(identifiers)} tracked workspaces")
+
+        for identifier in identifiers:
+            try:
+                await self.cleanup_workspace(identifier)
+            except Exception as e:
+                logger.error(f"Error cleaning workspace {identifier}: {e}")
+
+
+# ============================================================================
 # Validation Functions
 # ============================================================================
 
@@ -160,14 +321,24 @@ class SessionManager:
 
     def __init__(self):
         self.sessions: dict[str, ClaudeSDKClient] = {}
+        self.session_workspaces: dict[str, str] = {}  # session_id -> workspace_path
+        self.created_workspaces: set[str] = set()  # sessions where we created workspace
         self._lock = asyncio.Lock()
 
     async def create_session(
         self,
         session_id: str | None = None,
-        options: ClaudeAgentOptions | None = None
+        options: ClaudeAgentOptions | None = None,
+        workspace_path: str | None = None
     ) -> str:
-        """Create a new session and return its ID."""
+        """
+        Create a new session and return its ID.
+
+        Args:
+            session_id: Optional session ID (generated if not provided)
+            options: Claude agent options
+            workspace_path: Optional workspace path (if we created it)
+        """
         if session_id is None:
             session_id = str(uuid.uuid4())
 
@@ -178,6 +349,11 @@ class SessionManager:
             client = ClaudeSDKClient(options)
             await client.connect()
             self.sessions[session_id] = client
+
+            # Track workspace if we created it
+            if workspace_path is not None:
+                self.session_workspaces[session_id] = workspace_path
+                self.created_workspaces.add(session_id)
 
         return session_id
 
@@ -190,10 +366,22 @@ class SessionManager:
 
     async def close_session(self, session_id: str) -> None:
         """Close and remove a session."""
+        should_cleanup_workspace = False
+
         async with self._lock:
             if session_id in self.sessions:
                 client = self.sessions.pop(session_id)
                 await client.disconnect()
+
+                # Check if we need to cleanup workspace
+                if session_id in self.created_workspaces:
+                    self.created_workspaces.discard(session_id)
+                    self.session_workspaces.pop(session_id, None)
+                    should_cleanup_workspace = True
+
+        # Cleanup workspace outside lock
+        if should_cleanup_workspace:
+            await workspace_manager.cleanup_workspace(session_id)
 
     async def close_all(self) -> None:
         """Close all sessions."""
@@ -204,10 +392,16 @@ class SessionManager:
                 except Exception:
                     pass
             self.sessions.clear()
+            self.session_workspaces.clear()
+            self.created_workspaces.clear()
+
+        # Cleanup all workspaces
+        await workspace_manager.cleanup_all()
 
 
-# Global session manager
+# Global managers
 session_manager = SessionManager()
+workspace_manager = WorkspaceManager()
 
 
 # ============================================================================
@@ -217,9 +411,14 @@ session_manager = SessionManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
+    # Startup: Initialize workspace manager
+    await workspace_manager.initialize()
+
     yield
-    # Cleanup on shutdown
+
+    # Shutdown: Cleanup in order
     await session_manager.close_all()
+    await workspace_manager.cleanup_all()
 
 
 app = FastAPI(
@@ -247,7 +446,6 @@ class QueryRequest(BaseModel):
         None,
         description="Permission mode: default, acceptEdits, plan, bypassPermissions"
     )
-    cwd: str | None = Field(None, description="Working directory for the agent")
     include_custom_tools: bool = Field(
         True,
         description="Include server's custom tools (calculate, get_server_time)"
@@ -390,19 +588,19 @@ def _extract_description(skill_file) -> str | None:
 
 
 @app.get("/skills", response_model=SkillsListResponse)
-async def list_skills(cwd: str = Query(..., description="Working directory for project skills")):
+async def list_skills(cwd: str | None = Query(None, description="Working directory for project skills")):
     """
     List available skills from user and project directories.
 
     Skills are discovered from:
-    - User: ~/.claude/skills/*/SKILL.md
-    - Project: {cwd}/.claude/skills/*/SKILL.md (requires cwd)
+    - User: ~/.claude/skills/*/SKILL.md (always included)
+    - Project: {cwd}/.claude/skills/*/SKILL.md (only if cwd provided)
     """
     from pathlib import Path
 
     skills = []
 
-    # User skills (~/.claude/skills/)
+    # User skills (~/.claude/skills/) - always included
     user_skills_dir = Path.home() / ".claude" / "skills"
     if user_skills_dir.exists():
         for skill_dir in user_skills_dir.iterdir():
@@ -415,18 +613,19 @@ async def list_skills(cwd: str = Query(..., description="Working directory for p
                     path=str(skill_file)
                 ))
 
-    # Project skills ({cwd}/.claude/skills/)
-    project_skills_dir = Path(cwd) / ".claude" / "skills"
-    if project_skills_dir.exists():
-        for skill_dir in project_skills_dir.iterdir():
-            skill_file = skill_dir / "SKILL.md"
-            if skill_dir.is_dir() and skill_file.exists():
-                skills.append(SkillInfo(
-                    name=skill_dir.name,
-                    description=_extract_description(skill_file),
-                    location="project",
-                    path=str(skill_file)
-                ))
+    # Project skills ({cwd}/.claude/skills/) - only if cwd provided
+    if cwd:
+        project_skills_dir = Path(cwd) / ".claude" / "skills"
+        if project_skills_dir.exists():
+            for skill_dir in project_skills_dir.iterdir():
+                skill_file = skill_dir / "SKILL.md"
+                if skill_dir.is_dir() and skill_file.exists():
+                    skills.append(SkillInfo(
+                        name=skill_dir.name,
+                        description=_extract_description(skill_file),
+                        location="project",
+                        path=str(skill_file)
+                    ))
 
     return SkillsListResponse(skills=skills, count=len(skills), cwd=cwd)
 
@@ -444,46 +643,56 @@ async def single_query(request: QueryRequest):
     # Validate output_format if provided
     validate_output_format(request.output_format)
 
-    # Build options
-    mcp_servers = {}
-    allowed_tools = list(request.allowed_tools)
-
-    if request.include_custom_tools:
-        mcp_servers["tools"] = custom_tools_server
-        allowed_tools.extend([
-            "mcp__tools__get_server_time",
-            "mcp__tools__calculate"
-        ])
-
-    # Enable skills if specified
-    setting_sources = None
-    if request.skills or request.setting_sources:
-        # Add "Skill" tool if not already present
-        if "Skill" not in allowed_tools:
-            allowed_tools.append("Skill")
-        # Set setting_sources (default to both if skills specified)
-        setting_sources = request.setting_sources if request.setting_sources else ["user", "project"]
-
-    options = ClaudeAgentOptions(
-        system_prompt=request.system_prompt,
-        max_turns=request.max_turns,
-        allowed_tools=allowed_tools,
-        permission_mode=request.permission_mode,
-        cwd=request.cwd,
-        mcp_servers=mcp_servers if mcp_servers else None,
-        setting_sources=setting_sources,
-        output_format=request.output_format
-    )
-
-    result_text = None
-    session_id = None
-    is_error = False
-    total_cost = None
-    duration = None
-    structured_output = None
-    subtype = None
+    # Generate workspace ID and prepare for cleanup
+    workspace_id = str(uuid.uuid4())
+    workspace_path = None
 
     try:
+        # Create temporary workspace
+        workspace_path = await workspace_manager.create_workspace(
+            workspace_id,
+            owner_type="query"
+        )
+
+        # Build options
+        mcp_servers = {}
+        allowed_tools = list(request.allowed_tools)
+
+        if request.include_custom_tools:
+            mcp_servers["tools"] = custom_tools_server
+            allowed_tools.extend([
+                "mcp__tools__get_server_time",
+                "mcp__tools__calculate"
+            ])
+
+        # Enable skills if specified
+        setting_sources = None
+        if request.skills or request.setting_sources:
+            # Add "Skill" tool if not already present
+            if "Skill" not in allowed_tools:
+                allowed_tools.append("Skill")
+            # Set setting_sources (default to both if skills specified)
+            setting_sources = request.setting_sources if request.setting_sources else ["user", "project"]
+
+        options = ClaudeAgentOptions(
+            system_prompt=request.system_prompt,
+            max_turns=request.max_turns,
+            allowed_tools=allowed_tools,
+            permission_mode=request.permission_mode,
+            cwd=workspace_path,  # Use temporary workspace
+            mcp_servers=mcp_servers if mcp_servers else None,
+            setting_sources=setting_sources,
+            output_format=request.output_format
+        )
+
+        result_text = None
+        session_id = None
+        is_error = False
+        total_cost = None
+        duration = None
+        structured_output = None
+        subtype = None
+
         async with ClaudeSDKClient(options=options) as client:
             await client.query(request.prompt)
 
@@ -517,6 +726,11 @@ async def single_query(request: QueryRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+    finally:
+        # CRITICAL: Always cleanup workspace
+        if workspace_path:
+            await workspace_manager.cleanup_workspace(workspace_id)
+
 
 @app.post("/query/stream")
 async def stream_query(request: QueryRequest):
@@ -528,6 +742,14 @@ async def stream_query(request: QueryRequest):
     # Validate output_format if provided
     validate_output_format(request.output_format)
 
+    # Generate workspace ID and create workspace
+    workspace_id = str(uuid.uuid4())
+    workspace_path = await workspace_manager.create_workspace(
+        workspace_id,
+        owner_type="query_stream"
+    )
+
+    # Build options
     mcp_servers = {}
     allowed_tools = list(request.allowed_tools)
 
@@ -552,7 +774,7 @@ async def stream_query(request: QueryRequest):
         max_turns=request.max_turns,
         allowed_tools=allowed_tools,
         permission_mode=request.permission_mode,
-        cwd=request.cwd,
+        cwd=workspace_path,  # Use temporary workspace
         mcp_servers=mcp_servers if mcp_servers else None,
         setting_sources=setting_sources,
         output_format=request.output_format
@@ -587,6 +809,9 @@ async def stream_query(request: QueryRequest):
             yield "data: [DONE]\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        finally:
+            # CRITICAL: Cleanup workspace after streaming completes
+            await workspace_manager.cleanup_workspace(workspace_id)
 
     return StreamingResponse(
         generate(),
@@ -608,39 +833,68 @@ async def create_session(request: SessionRequest):
     # Validate output_format if provided
     validate_output_format(request.output_format)
 
-    mcp_servers = {}
-    allowed_tools = list(request.allowed_tools)
-
-    if request.include_custom_tools:
-        mcp_servers["tools"] = custom_tools_server
-        allowed_tools.extend([
-            "mcp__tools__get_server_time",
-            "mcp__tools__calculate"
-        ])
-
-    # Enable skills if specified
-    setting_sources = None
-    if request.skills or request.setting_sources:
-        # Add "Skill" tool if not already present
-        if "Skill" not in allowed_tools:
-            allowed_tools.append("Skill")
-        # Set setting_sources (default to both if skills specified)
-        setting_sources = request.setting_sources if request.setting_sources else ["user", "project"]
-
-    options = ClaudeAgentOptions(
-        system_prompt=request.system_prompt,
-        allowed_tools=allowed_tools,
-        permission_mode=request.permission_mode,
-        cwd=request.cwd,
-        mcp_servers=mcp_servers if mcp_servers else None,
-        setting_sources=setting_sources,
-        output_format=request.output_format
-    )
+    # Generate session ID first
+    session_id = str(uuid.uuid4())
+    workspace_path = None
+    created_workspace = False
 
     try:
-        session_id = await session_manager.create_session(options=options)
+        # Conditional workspace creation
+        if request.cwd is None:
+            # Create workspace with session ID as name
+            workspace_path = await workspace_manager.create_workspace(
+                session_id,
+                owner_type="session"
+            )
+            created_workspace = True
+        else:
+            # Use user-provided cwd
+            workspace_path = request.cwd
+            created_workspace = False
+
+        # Build options
+        mcp_servers = {}
+        allowed_tools = list(request.allowed_tools)
+
+        if request.include_custom_tools:
+            mcp_servers["tools"] = custom_tools_server
+            allowed_tools.extend([
+                "mcp__tools__get_server_time",
+                "mcp__tools__calculate"
+            ])
+
+        # Enable skills if specified
+        setting_sources = None
+        if request.skills or request.setting_sources:
+            # Add "Skill" tool if not already present
+            if "Skill" not in allowed_tools:
+                allowed_tools.append("Skill")
+            # Set setting_sources (default to both if skills specified)
+            setting_sources = request.setting_sources if request.setting_sources else ["user", "project"]
+
+        options = ClaudeAgentOptions(
+            system_prompt=request.system_prompt,
+            allowed_tools=allowed_tools,
+            permission_mode=request.permission_mode,
+            cwd=workspace_path,
+            mcp_servers=mcp_servers if mcp_servers else None,
+            setting_sources=setting_sources,
+            output_format=request.output_format
+        )
+
+        # Create session with workspace tracking
+        await session_manager.create_session(
+            session_id=session_id,
+            options=options,
+            workspace_path=workspace_path if created_workspace else None
+        )
+
         return SessionResponse(session_id=session_id, status="created")
+
     except Exception as e:
+        # Cleanup workspace if session creation failed
+        if created_workspace and workspace_path:
+            await workspace_manager.cleanup_workspace(session_id)
         raise HTTPException(status_code=500, detail=str(e))
 
 
