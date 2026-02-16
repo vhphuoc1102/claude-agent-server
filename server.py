@@ -475,125 +475,364 @@ async def verify_api_key(
 
 class QueryRequest(BaseModel):
     """Request model for one-shot queries."""
-    prompt: str = Field(..., description="The prompt to send to Claude")
-    system_prompt: str | None = Field(None, description="Optional system prompt")
-    max_turns: int | None = Field(None, description="Maximum conversation turns")
+    prompt: str = Field(
+        ...,
+        description="The main instruction or question to send to the Claude agent. "
+                    "This is the user message that drives the agent's behavior."
+    )
+    system_prompt: str | None = Field(
+        None,
+        description="Optional system prompt that sets the agent's persona, behavior, and context. "
+                    "Injected before the conversation to guide Claude's responses "
+                    "(e.g., 'You are a senior Python developer')."
+    )
+    max_turns: int | None = Field(
+        None,
+        description="Maximum number of agentic turns (LLM call + tool execution cycles) allowed. "
+                    "null = unlimited turns. Each turn consists of one LLM inference "
+                    "and any resulting tool executions. Use to prevent runaway agents.",
+        ge=1
+    )
     allowed_tools: list[str] = Field(
-        default_factory=lambda: ["Read", "Grep", "Glob"],
-        description="List of allowed tool names"
+        default=["Read", "Grep", "Glob"],
+        description="List of tool names the agent is permitted to use. "
+                    "Standard tools: 'Read' (read file contents), 'Write' (create/overwrite files), "
+                    "'Edit' (edit existing files), 'Bash' (execute shell commands), "
+                    "'Grep' (search file contents), 'Glob' (find files by pattern), "
+                    "'Skill' (use loaded skills). "
+                    "Custom MCP tools use the format 'mcp__<server_name>__<tool_name>' "
+                    "(e.g., 'mcp__tools__calculate'). "
+                    "When include_custom_tools is true, 'mcp__tools__get_server_time' and "
+                    "'mcp__tools__calculate' are automatically appended.",
+        examples=[["Read", "Grep", "Glob"], ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]]
     )
     permission_mode: str | None = Field(
         None,
-        description="Permission mode: default, acceptEdits, plan, bypassPermissions"
+        description="Controls how Claude handles tool permission checks. Valid values: "
+                    "'default' (standard restrictions, unmatched tools require approval), "
+                    "'acceptEdits' (auto-accept file edits and filesystem ops like mkdir/rm/mv/cp), "
+                    "'plan' (planning only, no tool execution allowed), "
+                    "'bypassPermissions' (all tools run without prompts — use with caution, "
+                    "subagents inherit this mode). "
+                    "null = server does not set a mode (SDK default behavior).",
+        examples=["default", "acceptEdits", "plan", "bypassPermissions"],
+        json_schema_extra={"enum": [None, "default", "acceptEdits", "plan", "bypassPermissions"]}
+    )
+    cwd: str | None = Field(
+        None,
+        description="Absolute path to the working directory for the agent. "
+                    "Used as the root for all file operations (Read, Write, Edit, Glob, etc.). "
+                    "null = server's current working directory.",
+        examples=["/workspace", "/home/user/project"]
     )
     include_custom_tools: bool = Field(
         True,
-        description="Include server's custom tools (calculate, get_server_time)"
+        description="Whether to include the server's built-in custom MCP tools: "
+                    "'mcp__tools__get_server_time' (returns current server timestamp) and "
+                    "'mcp__tools__calculate' (safe mathematical expression evaluator). "
+                    "When true, these tools are automatically added to allowed_tools."
     )
     skills: list[str] = Field(
-        default_factory=list,
-        description="List of skill names to enable (e.g., ['pdf-processor', 'code-review'])"
+        default=[],
+        description="List of skill directory names to enable for the agent. "
+                    "Skills are discovered from '~/.claude/skills/<name>/SKILL.md' (user-level) "
+                    "and '{cwd}/.claude/skills/<name>/SKILL.md' (project-level). "
+                    "When skills are specified, the 'Skill' tool is automatically added to allowed_tools. "
+                    "Use GET /skills?cwd=<path> to discover available skill names.",
+        examples=[["pdf-processor", "code-review"]]
     )
     setting_sources: list[str] = Field(
-        default_factory=list,
-        description="Setting sources for skill loading: ['user', 'project']"
+        default=[],
+        description="Sources to load skill settings from. Valid values: "
+                    "'user' (load from ~/.claude/skills/), "
+                    "'project' (load from {cwd}/.claude/skills/). "
+                    "If skills are specified but setting_sources is empty, defaults to ['user', 'project'].",
+        examples=[["user", "project"], ["user"], ["project"]]
     )
     output_format: dict[str, Any] | None = Field(
         None,
-        description="Structured output format configuration with 'type' and 'schema' fields"
+        description="Structured output format configuration. When provided, Claude returns "
+                    "validated JSON matching your schema. Required structure: "
+                    "{'type': 'json_schema', 'schema': {<JSON Schema object>}}. "
+                    "The 'type' field must be 'json_schema'. "
+                    "The 'schema' field must be a valid JSON Schema object with 'type', 'properties', etc. "
+                    "Response will include 'structured_output' (the parsed data) and "
+                    "'subtype' ('success' or 'error_max_structured_output_retries').",
+        examples=[{
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "score": {"type": "number"}
+                },
+                "required": ["summary"]
+            }
+        }]
     )
 
 
 class QueryResponse(BaseModel):
     """Response model for queries."""
-    result: str | None = Field(None, description="Final result text")
-    session_id: str = Field(..., description="Session ID for resumption")
-    is_error: bool = Field(False, description="Whether the query resulted in an error")
-    total_cost_usd: float | None = Field(None, description="Total cost in USD")
-    duration_ms: int | None = Field(None, description="Duration in milliseconds")
+    result: str | None = Field(
+        None,
+        description="Final text result from the agent. May be null when structured_output "
+                    "is used instead, or if the agent produced no text output."
+    )
+    session_id: str = Field(
+        ...,
+        description="UUID of the session used for this query. Can be used to identify "
+                    "the conversation context. Format: UUID v4 (e.g., '550e8400-e29b-41d4-a716-446655440000')."
+    )
+    is_error: bool = Field(
+        False,
+        description="Whether the agent encountered an unrecoverable error during execution. "
+                    "true = the query failed; check 'result' for error details."
+    )
+    total_cost_usd: float | None = Field(
+        None,
+        description="Cumulative Anthropic API cost in USD for all turns in this query. "
+                    "null if cost tracking is unavailable."
+    )
+    duration_ms: int | None = Field(
+        None,
+        description="Wall-clock time in milliseconds for the entire query execution, "
+                    "including all agent turns, tool calls, and processing."
+    )
     structured_output: dict[str, Any] | None = Field(
         None,
-        description="Validated structured output matching the provided JSON schema"
+        description="Validated structured output matching the JSON schema provided in "
+                    "the request's output_format. Only populated when output_format was "
+                    "specified and validation succeeded (subtype='success'). "
+                    "null if no output_format was requested or validation failed."
     )
     subtype: str | None = Field(
         None,
-        description="Result subtype: 'success', 'error_max_structured_output_retries', etc."
+        description="Result subtype indicating structured output validation status. "
+                    "Valid values: 'success' (output generated and validated successfully), "
+                    "'error_max_structured_output_retries' (could not produce valid output "
+                    "after maximum retry attempts). null if output_format was not used.",
+        examples=["success", "error_max_structured_output_retries"]
     )
 
 
 class SessionRequest(BaseModel):
-    """Request model for creating sessions."""
-    system_prompt: str | None = Field(None, description="Optional system prompt")
+    """Request model for creating persistent sessions that maintain conversation context across multiple chat messages."""
+    system_prompt: str | None = Field(
+        None,
+        description="Optional system prompt that sets the agent's persona, behavior, and context "
+                    "for the entire session. Applied to all messages in this session "
+                    "(e.g., 'You are a helpful coding assistant specialized in Python')."
+    )
     allowed_tools: list[str] = Field(
-        default_factory=lambda: ["Read", "Write", "Edit", "Bash", "Grep", "Glob"],
-        description="List of allowed tool names"
+        default=["Read", "Write", "Edit", "Bash", "Grep", "Glob"],
+        description="List of tool names the agent is permitted to use during this session. "
+                    "Default includes all standard tools for full development capability. "
+                    "Standard tools: 'Read' (read file contents), 'Write' (create/overwrite files), "
+                    "'Edit' (edit existing files), 'Bash' (execute shell commands), "
+                    "'Grep' (search file contents), 'Glob' (find files by pattern), "
+                    "'Skill' (use loaded skills). "
+                    "Custom MCP tools use the format 'mcp__<server_name>__<tool_name>'. "
+                    "Note: session default includes Write/Edit/Bash (unlike one-shot query).",
+        examples=[["Read", "Write", "Edit", "Bash", "Grep", "Glob"], ["Read", "Grep", "Glob"]]
     )
     permission_mode: str = Field(
         "acceptEdits",
-        description="Permission mode for the session"
+        description="Controls how Claude handles tool permission checks for this session. "
+                    "Valid values: "
+                    "'default' (standard restrictions, unmatched tools require approval), "
+                    "'acceptEdits' (auto-accept file edits and filesystem ops like mkdir/rm/mv/cp), "
+                    "'plan' (planning only, no tool execution allowed), "
+                    "'bypassPermissions' (all tools run without prompts — use with caution, "
+                    "subagents inherit this mode). "
+                    "Note: sessions default to 'acceptEdits' (unlike one-shot query which defaults to null).",
+        examples=["default", "acceptEdits", "plan", "bypassPermissions"],
+        json_schema_extra={"enum": ["default", "acceptEdits", "plan", "bypassPermissions"]}
     )
-    cwd: str | None = Field(None, description="Working directory")
-    include_custom_tools: bool = Field(True, description="Include custom tools")
+    cwd: str | None = Field(
+        None,
+        description="Absolute path to the working directory for the session. "
+                    "Used as root for all file operations throughout the session. "
+                    "null = server's current working directory.",
+        examples=["/workspace", "/home/user/project"]
+    )
+    include_custom_tools: bool = Field(
+        True,
+        description="Whether to include the server's built-in custom MCP tools: "
+                    "'mcp__tools__get_server_time' (returns current server timestamp) and "
+                    "'mcp__tools__calculate' (safe mathematical expression evaluator). "
+                    "When true, these tools are automatically added to allowed_tools."
+    )
     skills: list[str] = Field(
-        default_factory=list,
-        description="List of skill names to enable (e.g., ['pdf-processor', 'code-review'])"
+        default=[],
+        description="List of skill directory names to enable for this session. "
+                    "Skills are discovered from '~/.claude/skills/<name>/SKILL.md' (user-level) "
+                    "and '{cwd}/.claude/skills/<name>/SKILL.md' (project-level). "
+                    "When skills are specified, the 'Skill' tool is automatically added to allowed_tools. "
+                    "Use GET /skills?cwd=<path> to discover available skill names.",
+        examples=[["pdf-processor", "code-review"]]
     )
     setting_sources: list[str] = Field(
-        default_factory=list,
-        description="Setting sources for skill loading: ['user', 'project']"
+        default=[],
+        description="Sources to load skill settings from. Valid values: "
+                    "'user' (load from ~/.claude/skills/), "
+                    "'project' (load from {cwd}/.claude/skills/). "
+                    "If skills are specified but setting_sources is empty, defaults to ['user', 'project'].",
+        examples=[["user", "project"], ["user"], ["project"]]
     )
     output_format: dict[str, Any] | None = Field(
         None,
-        description="Structured output format configuration with 'type' and 'schema' fields"
+        description="Structured output format configuration for all responses in this session. "
+                    "When provided, all chat responses will include validated JSON matching your schema. "
+                    "Required structure: {'type': 'json_schema', 'schema': {<JSON Schema object>}}. "
+                    "The 'type' field must be 'json_schema'. "
+                    "The 'schema' field must be a valid JSON Schema object. "
+                    "Chat responses will include 'structured_output' and 'subtype' fields.",
+        examples=[{
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "score": {"type": "number"}
+                },
+                "required": ["summary"]
+            }
+        }]
     )
 
 
 class SessionResponse(BaseModel):
-    """Response model for session operations."""
-    session_id: str
-    status: str
+    """Response model for session creation and deletion."""
+    session_id: str = Field(
+        ...,
+        description="UUID v4 identifier for the session. Use this in session endpoints: "
+                    "POST /sessions/{session_id}/chat, POST /sessions/{session_id}/chat/stream, "
+                    "POST /sessions/{session_id}/interrupt, DELETE /sessions/{session_id}.",
+        examples=["550e8400-e29b-41d4-a716-446655440000"]
+    )
+    status: str = Field(
+        ...,
+        description="Current session status. Valid values: "
+                    "'created' (session successfully created and ready for chat), "
+                    "'deleted' (session closed and resources released).",
+        examples=["created", "deleted"],
+        json_schema_extra={"enum": ["created", "deleted"]}
+    )
 
 
 class ChatRequest(BaseModel):
-    """Request model for chat messages."""
-    message: str = Field(..., description="Message to send")
+    """Request model for sending a message within an active session."""
+    message: str = Field(
+        ...,
+        description="The user message to send within the active session context. "
+                    "The session maintains conversation history, so Claude remembers "
+                    "all previous messages exchanged in this session."
+    )
 
 
 class ChatResponse(BaseModel):
-    """Response model for chat messages."""
-    response: str
-    is_complete: bool = True
+    """Response model for non-streaming chat messages."""
+    response: str = Field(
+        ...,
+        description="Concatenated text from all assistant message blocks in this response. "
+                    "Contains Claude's full text reply for this chat turn."
+    )
+    is_complete: bool = Field(
+        True,
+        description="Whether the response is complete. Always true for non-streaming responses. "
+                    "For streaming responses, use the SSE 'done' event instead."
+    )
     structured_output: dict[str, Any] | None = Field(
         None,
-        description="Validated structured output if output_format was configured in session"
+        description="Validated structured output matching the JSON schema configured in the session's "
+                    "output_format. Only present when the session was created with output_format "
+                    "and validation succeeded (subtype='success'). null otherwise."
     )
     subtype: str | None = Field(
         None,
-        description="Result subtype for structured output validation status"
+        description="Structured output validation status. Valid values: "
+                    "'success' (output generated and validated successfully), "
+                    "'error_max_structured_output_retries' (could not produce valid output "
+                    "after maximum retry attempts). null if session has no output_format.",
+        examples=["success", "error_max_structured_output_retries"]
     )
 
 
 class MessageContent(BaseModel):
-    """Model for message content in streaming."""
-    type: str
-    text: str | None = None
-    tool_name: str | None = None
-    tool_input: dict | None = None
+    """Model for individual content blocks in streaming responses."""
+    type: str = Field(
+        ...,
+        description="Content block type. Valid values: "
+                    "'text' (text content from Claude), "
+                    "'tool_use' (Claude is calling a tool), "
+                    "'tool_result' (result from a tool execution), "
+                    "'result' (final result with cost/session info), "
+                    "'done' (session chat completion marker), "
+                    "'error' (an error occurred).",
+        examples=["text", "tool_use", "tool_result", "result", "done", "error"]
+    )
+    text: str | None = Field(
+        None,
+        description="Text content. Present when type='text' (Claude's response text) "
+                    "or type='error' (error message)."
+    )
+    tool_name: str | None = Field(
+        None,
+        description="Name of the tool being called. Present when type='tool_use'. "
+                    "Uses the same tool name format as allowed_tools "
+                    "(e.g., 'Read', 'mcp__tools__calculate')."
+    )
+    tool_input: dict | None = Field(
+        None,
+        description="Input arguments passed to the tool. Present when type='tool_use'. "
+                    "Structure varies by tool."
+    )
 
 
 class SkillInfo(BaseModel):
-    """Information about an available skill."""
-    name: str = Field(..., description="Skill name (directory name)")
-    description: str | None = Field(None, description="Skill description from frontmatter")
-    location: str = Field(..., description="'user' or 'project'")
-    path: str = Field(..., description="Full path to SKILL.md")
+    """Information about a single discovered skill."""
+    name: str = Field(
+        ...,
+        description="Skill name, which is the directory name under the skills folder. "
+                    "Use this value in the 'skills' field of QueryRequest or SessionRequest.",
+        examples=["pdf-processor", "code-review"]
+    )
+    description: str | None = Field(
+        None,
+        description="Human-readable skill description extracted from the YAML frontmatter "
+                    "'description' field in the skill's SKILL.md file. null if no frontmatter found."
+    )
+    location: str = Field(
+        ...,
+        description="Where the skill was discovered from. Valid values: "
+                    "'user' (from ~/.claude/skills/<name>/SKILL.md), "
+                    "'project' (from {cwd}/.claude/skills/<name>/SKILL.md).",
+        examples=["user", "project"],
+        json_schema_extra={"enum": ["user", "project"]}
+    )
+    path: str = Field(
+        ...,
+        description="Full absolute filesystem path to the skill's SKILL.md file.",
+        examples=["/home/user/.claude/skills/pdf-processor/SKILL.md"]
+    )
 
 
 class SkillsListResponse(BaseModel):
-    """Response for listing available skills."""
-    skills: list[SkillInfo] = Field(default_factory=list)
-    count: int = Field(0, description="Total number of skills found")
-    cwd: str | None = Field(None, description="Working directory used for project skills")
+    """Response containing all discovered skills from user and project directories."""
+    skills: list[SkillInfo] = Field(
+        default_factory=list,
+        description="List of discovered skills. Empty if no skills found in either location."
+    )
+    count: int = Field(
+        0,
+        description="Total number of skills discovered across both user and project directories."
+    )
+    cwd: str | None = Field(
+        None,
+        description="The working directory that was used to search for project-level skills "
+                    "(i.e., {cwd}/.claude/skills/). Same value as the 'cwd' query parameter."
+    )
 
 
 # ============================================================================
