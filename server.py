@@ -7,6 +7,7 @@ Supports session management, streaming responses, and custom tools.
 
 import asyncio
 import logging
+import os
 import shutil
 import uuid
 from contextlib import asynccontextmanager
@@ -299,10 +300,28 @@ def validate_output_format(output_format: dict[str, Any] | None) -> None:
             detail="output_format type must be 'json_schema'"
         )
 
+    # Support OpenAI-style nested format: {"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}
+    # Normalize it to the flat format: {"type": "json_schema", "schema": {...}}
+    if "schema" not in output_format and "json_schema" in output_format:
+        json_schema_wrapper = output_format["json_schema"]
+        if not isinstance(json_schema_wrapper, dict):
+            raise HTTPException(
+                status_code=422,
+                detail="output_format json_schema must be a dictionary"
+            )
+        if "schema" not in json_schema_wrapper:
+            raise HTTPException(
+                status_code=422,
+                detail="output_format json_schema must contain 'schema' field"
+            )
+        # Normalize: hoist schema to top level and remove the wrapper
+        output_format["schema"] = json_schema_wrapper["schema"]
+        del output_format["json_schema"]
+
     if "schema" not in output_format:
         raise HTTPException(
             status_code=422,
-            detail="output_format must contain 'schema' field"
+            detail="output_format must contain 'schema' field (either at top level or inside 'json_schema')"
         )
 
     schema = output_format["schema"]
@@ -426,7 +445,11 @@ app = FastAPI(
     title="Claude Code SDK Server",
     description="HTTP server exposing Claude Agent SDK capabilities",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    swagger_ui_parameters={
+        "defaultModelsExpandDepth": 3,
+        "defaultModelRendering": "model",
+    }
 )
 
 

@@ -43,8 +43,8 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Claude Code CLI globally
-RUN npm install -g @anthropic-ai/claude-code
+# Install pnpm and Claude Code CLI globally
+RUN npm install -g pnpm @anthropic-ai/claude-code
 
 # Copy application code
 COPY server.py .
